@@ -76,7 +76,7 @@ class FavourManagerTool(Star):
         )
 
         # 数据库初始化
-        self.data_dir = Path(context.get_config().get("plugin.data_dir", "./data")) / "plugin_data" / "astrbot_plugin_favour_ultra"
+        self.data_dir = Path(context.get_config().get("plugin.data_dir", "./data")) / "plugin_data" / "astrbot_plugin_favour_ultra_modify"
         self.db_manager = FavourDBManager(self.data_dir, self.min_favour_value, self.max_favour_value)
 
         # 异步初始化数据库和迁移数据
