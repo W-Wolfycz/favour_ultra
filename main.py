@@ -3,6 +3,7 @@
 # Original work: https://github.com/nuomicici/astrbot_plugin_Favour_Ultra/
 # Licensed under the Apache License, Version 2.0
 import re
+import json
 import traceback
 import shutil
 import hashlib
@@ -41,7 +42,12 @@ class FavourManagerTool(Star):
         self.min_favour_value = self.config.get("min_favour_value", -100)
         self.max_favour_value = self.config.get("max_favour_value", 100)
         self.default_favour = self.config.get("default_favour", 0)
-        self.favour_rule_prompt = self.config.get("favour_rule_prompt", "")
+
+        # 关系映射配置
+        rel_conf = self.config.get("relationship_config", {})
+        self.relationship_mode = rel_conf.get("mode", "simple")
+        self.relationship_simple_list = rel_conf.get("simple_list", ["极度厌恶", "厌恶", "反感", "普通", "喜欢", "亲密", "挚爱"])
+        self.relationship_advance_raw = rel_conf.get("advance_config", "")
 
         # 高级配置
         adv_conf = self.config.get("advanced_config", {})
@@ -54,6 +60,14 @@ class FavourManagerTool(Star):
         self.perm_level_threshold = adv_conf.get("level_threshold", 50)
         self.blocked_sessions = adv_conf.get("blocked_sessions", [])
         self.allowed_sessions = adv_conf.get("allowed_sessions", [])
+
+        # 命令权限配置
+        self.member_commands = adv_conf.get("member_commands", ["查询好感度", "查询当前好感度", "好感度帮助", "好感度指令帮助"])
+        self.high_commands = adv_conf.get("high_commands", [])
+        self.admin_commands = adv_conf.get("admin_commands", ["修改好感度"])
+        self.owner_commands = adv_conf.get("owner_commands", ["清空好感度", "清空当前好感度"])
+        self.superuser_commands = adv_conf.get("superuser_commands", ["查询全部好感度", "查询全局好感度", "全局修改好感度", "跨会话修改", "清空全局好感度"])
+        self.query_others_favour_level = adv_conf.get("query_others_favour_level", "群管理员")
 
         # 冷暴力配置
         cv_conf = self.config.get("cold_violence_config", {})
@@ -187,6 +201,107 @@ class FavourManagerTool(Star):
         level = await perm_mgr.get_perm_level(event, event.get_sender_id())
         return level >= required_level
 
+    async def _check_command_permission(self, event: AstrMessageEvent, command_name: str) -> bool:
+        """根据配置的命令权限列表检查用户是否可以使用指定命令"""
+        user_id = str(event.get_sender_id())
+
+        if user_id in self.admins_id:
+            role = PermLevel.SUPERUSER
+        elif isinstance(event, AiocqhttpMessageEvent):
+            perm_mgr = PermissionManager.get_instance()
+            role = await perm_mgr.get_perm_level(event, user_id)
+        else:
+            role = PermLevel.MEMBER
+
+        allowed_commands = set()
+        if role >= PermLevel.MEMBER:
+            allowed_commands.update(self.member_commands)
+        if role >= PermLevel.HIGH:
+            allowed_commands.update(self.high_commands)
+        if role >= PermLevel.ADMIN:
+            allowed_commands.update(self.admin_commands)
+        if role >= PermLevel.OWNER:
+            allowed_commands.update(self.owner_commands)
+        if role >= PermLevel.SUPERUSER:
+            allowed_commands.update(self.superuser_commands)
+
+        return command_name in allowed_commands
+
+    _LEVEL_NAME_MAP = {
+        "普通成员": PermLevel.MEMBER,
+        "高等级群员": PermLevel.HIGH,
+        "群管理员": PermLevel.ADMIN,
+        "群主": PermLevel.OWNER,
+        "Bot管理员": PermLevel.SUPERUSER,
+    }
+
+    async def _get_user_perm_level(self, event: AstrMessageEvent) -> int:
+        """获取用户权限等级"""
+        user_id = str(event.get_sender_id())
+        if user_id in self.admins_id:
+            return PermLevel.SUPERUSER
+        if isinstance(event, AiocqhttpMessageEvent):
+            perm_mgr = PermissionManager.get_instance()
+            return await perm_mgr.get_perm_level(event, user_id)
+        return PermLevel.MEMBER
+
+    def _get_relationship(self, favour: int) -> str:
+        """根据好感度数值获取关系描述"""
+        favour = max(self.min_favour_value, min(self.max_favour_value, favour))
+
+        if self.relationship_mode == "simple":
+            items = self.relationship_simple_list
+            if not items:
+                return "未知"
+            n = len(items)
+            total = self.max_favour_value - self.min_favour_value
+            if total <= 0:
+                return items[0]
+            idx = int((favour - self.min_favour_value) * n / total)
+            return items[max(0, min(idx, n - 1))]
+        else:
+            try:
+                items = json.loads(self.relationship_advance_raw) if isinstance(self.relationship_advance_raw, str) else self.relationship_advance_raw
+                for item in items:
+                    if item.get("min_value", self.min_favour_value) <= favour <= item.get("max_value", self.max_favour_value):
+                        return item.get("describe", "未知")
+            except (json.JSONDecodeError, TypeError):
+                pass
+            return "未知"
+
+    def _build_relationship_prompt(self) -> str:
+        """根据关系配置生成LLM注入用的规则文本"""
+        if self.relationship_mode == "simple":
+            items = self.relationship_simple_list
+            if not items:
+                return ""
+            n = len(items)
+            total = self.max_favour_value - self.min_favour_value
+            step = total / n
+            lines = [f"- 好感度等级：根据好感度数值的高低，共分为{n}个等级。"]
+            for i, desc in enumerate(items):
+                lo = int(self.min_favour_value + i * step)
+                hi = int(self.min_favour_value + (i + 1) * step - 1) if i < n - 1 else self.max_favour_value
+                lines.append(f" - [{lo}~{hi}]：`{desc}`。")
+            return "\n".join(lines)
+        else:
+            try:
+                items = json.loads(self.relationship_advance_raw) if isinstance(self.relationship_advance_raw, str) else self.relationship_advance_raw
+                n = len(items)
+                lines = [f"- 好感度等级：根据好感度数值的高低，共分为{n}个等级。"]
+                for item in items:
+                    desc = item.get("describe", "未知")
+                    lo = item.get("min_value", self.min_favour_value)
+                    hi = item.get("max_value", self.max_favour_value)
+                    rule = item.get("rule", "")
+                    if rule:
+                        lines.append(f" - [{lo}~{hi}]：`{desc}`。{rule}")
+                    else:
+                        lines.append(f" - [{lo}~{hi}]：`{desc}`。")
+                return "\n".join(lines)
+            except (json.JSONDecodeError, TypeError):
+                return ""
+
     async def _get_initial_favour(self, event: AstrMessageEvent) -> int:
         user_id = str(event.get_sender_id())
 
@@ -285,16 +400,6 @@ class FavourManagerTool(Star):
             else:
                 current_favour = await self._get_initial_favour(event)
 
-            # 获取 Admin Status
-            if str(user_id) in self.admins_id:
-                admin_status = "Bot管理员"
-            elif await self._check_permission(event, PermLevel.OWNER):
-                admin_status = "群主"
-            elif await self._check_permission(event, PermLevel.ADMIN):
-                admin_status = "群管理员"
-            else:
-                admin_status = "普通用户"
-
 # 根据模式选择 Prompt
             mode_instruction = ""
             if self.favour_mode == "galgame":
@@ -333,8 +438,8 @@ class FavourManagerTool(Star):
     </SecurityProtocols>
     <UserContext>
         <UserID>{user_id}</UserID>
-        <AdminStatus>{admin_status}</AdminStatus>
         <CurrentFavour>{current_favour}</CurrentFavour>
+        <MinFavour>{min_favour_value}</MinFavour>
         <MaxFavour>{max_favour_value}</MaxFavour>
     </UserContext>
     <InteractionDynamics>
@@ -347,6 +452,9 @@ class FavourManagerTool(Star):
                 IF {current_favour} >= <MaxFavour>:
                     DISABLE [好感度 上升].
                     FORCE_ALLOWED_OUTPUTS: [好感度 持平], [好感度 降低].
+                IF {current_favour} <= <MinFavour>:
+                    DISABLE [好感度 降低].
+                    FORCE_ALLOWED_OUTPUTS: [好感度 持平], [好感度 上升].
             </LimitConstraint>
             <Requirement>
                 EVALUATE user_input -> CALCULATE delta -> APPEND log at EOF.
@@ -360,16 +468,18 @@ class FavourManagerTool(Star):
     </OutputCalibration>
 </Plugin_FavorabilityManager>
 """
+            relationship_rule = self._build_relationship_prompt()
+
             prompt_final = prompt_template.format(
                 user_id=user_id,
-                admin_status=admin_status,
                 current_favour=current_favour,
                 mode_instruction=mode_instruction,
-                the_rule=self.favour_rule_prompt,
+                the_rule=relationship_rule,
                 increase_min=self.favour_increase_min,
                 increase_max=self.favour_increase_max,
                 decrease_min=self.favour_decrease_min,
                 decrease_max=self.favour_decrease_max,
+                min_favour_value=self.min_favour_value,
                 max_favour_value=self.max_favour_value
             )
 
@@ -463,20 +573,37 @@ class FavourManagerTool(Star):
     @filter.command("查询好感度", alias={'查好感度', '好感度查询', '查看好感度', '好感度'})
     async def query_favour(self, event: AstrMessageEvent, target: str = ""):
         """查询自己或他人的好感度"""
-        target_uid = self._get_target_uid(event, target) or str(event.get_sender_id())
+        if not await self._check_command_permission(event, "查询好感度"):
+            yield event.plain_result("权限不足！你无法使用此命令。")
+            return
+
+        sender_id = str(event.get_sender_id())
+        target_uid = self._get_target_uid(event, target) or sender_id
+
+        # 查询他人好感度需要满足配置的最低等级
+        if target_uid != sender_id:
+            required = self._LEVEL_NAME_MAP.get(self.query_others_favour_level, PermLevel.ADMIN)
+            user_level = await self._get_user_perm_level(event)
+            if user_level < required:
+                yield event.plain_result("权限不足！你只能查看自己的好感度。")
+                return
         session_id = self._get_session_id(event)
 
         record = await self.db_manager.get_favour(target_uid, session_id)
-        fav = record.favour if record else (await self._get_initial_favour(event) if target_uid == str(event.get_sender_id()) else 0)
+        fav = record.favour if record else (await self._get_initial_favour(event) if target_uid == sender_id else 0)
 
         name = await self._get_user_display_name(event, target_uid)
 
-        msg = f"🔍 用户：{name}\n🆔 ID：{target_uid}\n❤ 好感度：{fav}"
+        msg = f"🔍 用户：{name}\n🆔 ID：{target_uid}\n❤ 好感度：{fav}\n💕 关系：{self._get_relationship(fav)}"
         yield event.plain_result(msg)
 
     @filter.command("查询当前好感度", alias={'查当前好感度', '查询本群好感度', '查本群好感度', '查群好感度', '查询群好感度', '当前好感度', '本群好感度', '群好感度'})
     async def query_current_session_favour(self, event: AstrMessageEvent, page: int = 1):
         """查询当前会话的所有好感度记录 (支持分页)"""
+        if not await self._check_command_permission(event, "查询当前好感度"):
+            yield event.plain_result("权限不足！你无法使用此命令。")
+            return
+
         if self.is_global_favour:
             yield event.plain_result("当前为全局模式，此命令无效。请使用【查询全局好感度】。")
             return
@@ -501,22 +628,23 @@ class FavourManagerTool(Star):
         page_records = records[start_idx:end_idx]
 
         headers = [
-            "| 用户昵称 | 用户ID | 好感度 |",
-            "| :--- | :--- | :---: |"
+            "| 用户昵称 | 用户ID | 好感度 | 关系 |",
+            "| :--- | :--- | :---: | :---: |"
         ]
         rows = []
         for r in page_records:
             name = self._escape_markdown(await self._get_user_display_name(event, r.user_id))
-            rows.append(f"| {name} | {r.user_id} | {r.favour} |")
+            rel = self._escape_markdown(self._get_relationship(r.favour))
+            rows.append(f"| {name} | {r.user_id} | {r.favour} | {rel} |")
 
         title = f"📊 当前会话好感度列表 (SID: {self._escape_markdown(session_id)}) - 第 {page}/{total_pages} 页"
         await self._send_chunked_t2i(event, title, headers, rows)
 
     @filter.command("查询全部好感度", alias={'查全部好感度', '查看全部好感度', '全部好感度'})
     async def query_all_sessions_favour(self, event: AstrMessageEvent):
-        """查询所有非全局会话的好感度 (仅Bot管理员)"""
-        if not await self._check_permission(event, PermLevel.SUPERUSER):
-            yield event.plain_result("权限不足！仅Bot管理员可用。")
+        """查询所有非全局会话的好感度"""
+        if not await self._check_command_permission(event, "查询全部好感度"):
+            yield event.plain_result("权限不足！你无法使用此命令。")
             return
 
         records = await self.db_manager.get_non_global_records()
@@ -533,8 +661,8 @@ class FavourManagerTool(Star):
             session_groups[r.session_id].append(r)
 
         headers = [
-            "| 用户ID | 好感度 |",
-            "| :--- | :---: |"
+            "| 用户ID | 好感度 | 关系 |",
+            "| :--- | :---: | :---: |"
         ]
         rows = []
         hidden_private_sessions = 0
@@ -559,9 +687,10 @@ class FavourManagerTool(Star):
 
             for r in display_list:
                 if r is None:
-                    rows.append("| ... | ... |")
+                    rows.append("| ... | ... | ... |")
                 else:
-                    rows.append(f"| {r.user_id} | {r.favour} |")
+                    rel = self._escape_markdown(self._get_relationship(r.favour))
+                    rows.append(f"| {r.user_id} | {r.favour} | {rel} |")
 
         if hidden_private_sessions > 0:
             rows.append(f"\n> 另有 {hidden_private_sessions} 个私聊会话的数据已隐藏（仅在私聊查询时显示）。")
@@ -570,9 +699,9 @@ class FavourManagerTool(Star):
 
     @filter.command("查询全局好感度", alias={'全局好感度', '查全局好感度', '查看全局好感度', '全局好感度查询'})
     async def query_global_favour(self, event: AstrMessageEvent, page: int = 1):
-        """查询全局模式下的好感度 (仅Bot管理员，支持分页)"""
-        if not await self._check_permission(event, PermLevel.SUPERUSER):
-            yield event.plain_result("权限不足！仅Bot管理员可用。")
+        """查询全局模式下的好感度 (支持分页)"""
+        if not await self._check_command_permission(event, "查询全局好感度"):
+            yield event.plain_result("权限不足！你无法使用此命令。")
             return
 
         records = await self.db_manager.get_global_records()
@@ -593,12 +722,13 @@ class FavourManagerTool(Star):
         page_records = records[start_idx:end_idx]
 
         headers = [
-            "| 用户ID | 好感度 |",
-            "| :--- | :---: |"
+            "| 用户ID | 好感度 | 关系 |",
+            "| :--- | :---: | :---: |"
         ]
         rows = []
         for r in page_records:
-            rows.append(f"| {r.user_id} | {r.favour} |")
+            rel = self._escape_markdown(self._get_relationship(r.favour))
+            rows.append(f"| {r.user_id} | {r.favour} | {rel} |")
 
         title = f"📊 全局好感度记录 - 第 {page}/{total_pages} 页"
         await self._send_chunked_t2i(event, title, headers, rows)
@@ -607,9 +737,9 @@ class FavourManagerTool(Star):
 
     @filter.command("修改好感度")
     async def modify_favour(self, event: AstrMessageEvent, target: str, value: int):
-        """修改好感度: /修改好感度 @用户 50 (群管理员)"""
-        if not await self._check_permission(event, PermLevel.ADMIN):
-            yield event.plain_result("权限不足！需要群管理员及以上权限。")
+        """修改好感度: /修改好感度 @用户 50"""
+        if not await self._check_command_permission(event, "修改好感度"):
+            yield event.plain_result("权限不足！你无法使用此命令。")
             return
 
         uid = self._get_target_uid(event, target)
@@ -628,9 +758,9 @@ class FavourManagerTool(Star):
 
     @filter.command("全局修改好感度")
     async def global_modify_favour(self, event: AstrMessageEvent, target: str, value: int):
-        """全局修改好感度 (Bot管理员)"""
-        if not await self._check_permission(event, PermLevel.SUPERUSER):
-            yield event.plain_result("权限不足！仅Bot管理员可用。")
+        """全局修改好感度"""
+        if not await self._check_command_permission(event, "全局修改好感度"):
+            yield event.plain_result("权限不足！你无法使用此命令。")
             return
 
         uid = self._get_target_uid(event, target)
@@ -646,9 +776,9 @@ class FavourManagerTool(Star):
 
     @filter.command("跨会话修改")
     async def cross_session_modify(self, event: AstrMessageEvent, target_sid: str, operation: str, target_uid: str, arg1: str = ""):
-        """跨会话修改数据 (Bot管理员)"""
-        if not await self._check_permission(event, PermLevel.SUPERUSER):
-            yield event.plain_result("权限不足！仅Bot管理员可用。")
+        """跨会话修改数据"""
+        if not await self._check_command_permission(event, "跨会话修改"):
+            yield event.plain_result("权限不足！你无法使用此命令。")
             return
 
         if not target_sid or not operation or not target_uid:
@@ -675,9 +805,9 @@ class FavourManagerTool(Star):
 
     @filter.command("清空好感度")
     async def clear_user_favour(self, event: AstrMessageEvent, target: str):
-        """清空指定用户好感度 (群主)"""
-        if not await self._check_permission(event, PermLevel.OWNER):
-            yield event.plain_result("权限不足！需要群主及以上权限。")
+        """清空指定用户好感度"""
+        if not await self._check_command_permission(event, "清空好感度"):
+            yield event.plain_result("权限不足！你无法使用此命令。")
             return
 
         uid = self._get_target_uid(event, target)
@@ -712,9 +842,9 @@ class FavourManagerTool(Star):
 
     @filter.command("清空当前好感度")
     async def clear_current_favour(self, event: AstrMessageEvent):
-        """清空当前会话好感度 (群主)"""
-        if not await self._check_permission(event, PermLevel.OWNER):
-            yield event.plain_result("权限不足！需要群主及以上权限。")
+        """清空当前会话好感度"""
+        if not await self._check_command_permission(event, "清空当前好感度"):
+            yield event.plain_result("权限不足！你无法使用此命令。")
             return
 
         sid = self._get_session_id(event)
@@ -744,9 +874,9 @@ class FavourManagerTool(Star):
 
     @filter.command("清空全局好感度")
     async def clear_all_favour(self, event: AstrMessageEvent):
-        """清空所有好感度 (Bot管理员)"""
-        if not await self._check_permission(event, PermLevel.SUPERUSER):
-            yield event.plain_result("权限不足！仅Bot管理员可用。")
+        """清空所有好感度"""
+        if not await self._check_command_permission(event, "清空全局好感度"):
+            yield event.plain_result("权限不足！你无法使用此命令。")
             return
 
         yield event.plain_result(f"🚨 极度危险：即将清空数据库中【所有】好感度数据！\n请在 30 秒内回复「确认清空所有数据」以继续，回复其他内容取消。")
@@ -778,62 +908,127 @@ class FavourManagerTool(Star):
     @filter.command("好感度帮助", alias={'查看好感度帮助'})
     async def help_menu(self, event: AstrMessageEvent):
         """显示可用命令菜单"""
-        is_superuser = await self._check_permission(event, PermLevel.SUPERUSER)
-        is_owner = await self._check_permission(event, PermLevel.OWNER)
-        is_admin = await self._check_permission(event, PermLevel.ADMIN)
-
         msg = ["⭐ 好感度插件命令菜单 ⭐"]
 
-        msg.append("\n[通用命令]")
-        msg.append("- 查询好感度 [@用户]")
-        msg.append("- 查询当前好感度 [页码]")
-        msg.append("- 好感度指令帮助")
+        # 查询类
+        query_cmds = []
+        if await self._check_command_permission(event, "查询好感度"):
+            required = self._LEVEL_NAME_MAP.get(self.query_others_favour_level, PermLevel.ADMIN)
+            user_level = await self._get_user_perm_level(event)
+            if user_level >= required:
+                query_cmds.append("- 查询好感度 [@用户]")
+            else:
+                query_cmds.append("- 查询好感度")
+        if not self.is_global_favour and await self._check_command_permission(event, "查询当前好感度"):
+            query_cmds.append("- 查询当前好感度 [页码]")
+        if not self.is_global_favour and await self._check_command_permission(event, "查询全部好感度"):
+            query_cmds.append("- 查询全部好感度")
+        if self.is_global_favour and await self._check_command_permission(event, "查询全局好感度"):
+            query_cmds.append("- 查询全局好感度 [页码]")
+        if query_cmds:
+            msg.append("\n[查询命令]")
+            msg.extend(query_cmds)
 
-        if is_admin or is_superuser:
-            msg.append("\n[管理员命令]")
-            msg.append("- 修改好感度 @用户 <数值>")
+        # 修改类
+        modify_cmds = []
+        if await self._check_command_permission(event, "修改好感度"):
+            modify_cmds.append("- 修改好感度 @用户 <数值>")
+        if await self._check_command_permission(event, "全局修改好感度"):
+            modify_cmds.append("- 全局修改好感度 @用户 <数值>")
+        if await self._check_command_permission(event, "跨会话修改"):
+            modify_cmds.append("- 跨会话修改 <sid> <操作> ...")
+        if modify_cmds:
+            msg.append("\n[修改命令]")
+            msg.extend(modify_cmds)
 
-        if is_owner or is_superuser:
-            msg.append("\n[群主命令]")
-            msg.append("- 清空好感度 @用户")
-            msg.append("- 清空当前好感度")
+        # 清空类
+        clear_cmds = []
+        if await self._check_command_permission(event, "清空好感度"):
+            clear_cmds.append("- 清空好感度 @用户")
+        if await self._check_command_permission(event, "清空当前好感度"):
+            clear_cmds.append("- 清空当前好感度")
+        if await self._check_command_permission(event, "清空全局好感度"):
+            clear_cmds.append("- 清空全局好感度")
+        if clear_cmds:
+            msg.append("\n[清空命令]")
+            msg.extend(clear_cmds)
 
-        if is_superuser:
-            msg.append("\n[Bot管理员命令]")
-            msg.append("- 查询全部好感度")
-            msg.append("- 查询全局好感度 [页码]")
-            msg.append("- 全局修改好感度 @用户 <数值>")
-            msg.append("- 跨会话修改 <sid> <操作> ...")
-            msg.append("- 清空全局好感度")
+        if await self._check_command_permission(event, "好感度指令帮助"):
+            msg.append("\n- 好感度指令帮助")
 
         yield event.plain_result("\n".join(msg))
 
     @filter.command("好感度指令帮助")
     async def help_usage(self, event: AstrMessageEvent):
         """显示详细指令用法"""
-        msg = """⭐ 好感度指令用法示例 ⭐
+        msg_parts = ["⭐ 好感度指令用法示例 ⭐"]
+        section = 0
 
-1. 查询好感度
-   用法: /查询好感度 [@用户]
-   示例: /查询好感度 @糯米茨
-   用法: /查询当前好感度 [页码]
-   示例: /查询当前好感度 2
+        # 查询类
+        has_query = await self._check_command_permission(event, "查询好感度")
+        if not self.is_global_favour:
+            has_query = has_query or await self._check_command_permission(event, "查询当前好感度")
+            has_query = has_query or await self._check_command_permission(event, "查询全部好感度")
+        else:
+            has_query = has_query or await self._check_command_permission(event, "查询全局好感度")
+        if has_query:
+            section += 1
+            msg_parts.append(f"\n{section}. 查询好感度")
+            if await self._check_command_permission(event, "查询好感度"):
+                required = self._LEVEL_NAME_MAP.get(self.query_others_favour_level, PermLevel.ADMIN)
+                user_level = await self._get_user_perm_level(event)
+                if user_level >= required:
+                    msg_parts.append("   用法: /查询好感度 [@用户]")
+                    msg_parts.append("   示例: /查询好感度 @Wolfycz")
+                else:
+                    msg_parts.append("   用法: /查询好感度")
+                    msg_parts.append("   说明: 你只能查看自己的好感度。")
+            if not self.is_global_favour:
+                if await self._check_command_permission(event, "查询当前好感度"):
+                    msg_parts.append("   用法: /查询当前好感度 [页码]")
+                    msg_parts.append("   示例: /查询当前好感度 2")
+                if await self._check_command_permission(event, "查询全部好感度"):
+                    msg_parts.append("   用法: /查询全部好感度")
+                    msg_parts.append("   说明: 查看所有非全局会话的好感度记录。")
+            else:
+                if await self._check_command_permission(event, "查询全局好感度"):
+                    msg_parts.append("   用法: /查询全局好感度 [页码]")
+                    msg_parts.append("   示例: /查询全局好感度 2")
 
-2. 修改好感度 (管理员)
-   用法: /修改好感度 @用户 <数值>
-   示例: /修改好感度 @糯米茨 60
+        # 修改好感度
+        if await self._check_command_permission(event, "修改好感度"):
+            section += 1
+            msg_parts.append(f"\n{section}. 修改好感度")
+            msg_parts.append("   用法: /修改好感度 @用户 <数值>")
+            msg_parts.append("   示例: /修改好感度 @Wolfycz 60")
 
-3. 清空操作 (群主/Bot管理员)
-   用法: /清空好感度 @用户
-   用法: /清空当前好感度
-   用法: /清空全局好感度
-   说明: 清空操作需要二次确认，并会自动备份数据。
+        # 全局修改好感度
+        if await self._check_command_permission(event, "全局修改好感度"):
+            section += 1
+            msg_parts.append(f"\n{section}. 全局修改好感度")
+            msg_parts.append("   用法: /全局修改好感度 @用户 <数值>")
+            msg_parts.append("   示例: /全局修改好感度 @Wolfycz 100")
+            msg_parts.append("   说明: 将修改该用户在所有群/私聊中的数据。")
 
-4. 全局操作 (Bot管理员)
-   示例: /全局修改好感度 @糯米茨 100
-   说明: 将修改该用户在所有群/私聊中的数据。
+        # 跨会话修改
+        if await self._check_command_permission(event, "跨会话修改"):
+            section += 1
+            msg_parts.append(f"\n{section}. 跨会话修改")
+            msg_parts.append("   用法: /跨会话修改 <会话ID> 修改好感度 <用户ID> <数值>")
+            msg_parts.append("   示例: /跨会话修改 group:123456 修改好感度 10001 50")
 
-5. 跨会话修改 (Bot管理员)
-   示例: /跨会话修改 group:123456 修改好感度 10001 50
-"""
-        yield event.plain_result(msg)
+        # 清空操作
+        clear_cmds = []
+        if await self._check_command_permission(event, "清空好感度"):
+            clear_cmds.append("   用法: /清空好感度 @用户")
+        if await self._check_command_permission(event, "清空当前好感度"):
+            clear_cmds.append("   用法: /清空当前好感度")
+        if await self._check_command_permission(event, "清空全局好感度"):
+            clear_cmds.append("   用法: /清空全局好感度")
+        if clear_cmds:
+            section += 1
+            msg_parts.append(f"\n{section}. 清空操作")
+            msg_parts.extend(clear_cmds)
+            msg_parts.append("   说明: 清空操作需要二次确认，并会自动备份数据。")
+
+        yield event.plain_result("\n".join(msg_parts))
