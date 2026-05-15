@@ -93,7 +93,7 @@ class FavourManagerTool(Star):
         self.data_dir = Path(context.get_config().get("plugin.data_dir", "./data")) / "plugin_data" / "astrbot_plugin_favour_ultra_modify"
         self.db_manager = FavourDBManager(self.data_dir, self.min_favour_value, self.max_favour_value)
 
-        # 异步初始化数据库和迁移数据
+        # 异步初始化数据库
         asyncio.create_task(self._init_storage())
 
         # 正则表达式
@@ -106,25 +106,27 @@ class FavourManagerTool(Star):
         self.cold_violence_users: Dict[str, datetime] = {} # Key: user_id or session_id:user_id
         self.consecutive_decreases: Dict[str, int] = {} # 记录连续降低次数
 
+        # Playwright T2I
+        self._pw_instance = None
+        self._pw_browser = None
+        self._t2i_output_dir = self.data_dir / "t2i_output"
+        self._t2i_output_dir.mkdir(parents=True, exist_ok=True)
+        self._html_template = (Path(__file__).parent / "自定义t2i模板.html").read_text(encoding="utf-8")
+        _ver_match = re.search(r'version:\s*["\']?(.+?)["\']?\s*$', (Path(__file__).parent / "metadata.yaml").read_text(), re.MULTILINE)
+        self._plugin_version = _ver_match.group(1) if _ver_match else ""
+
     async def _init_storage(self):
-        """初始化存储并迁移数据"""
         try:
             await self.db_manager.init_db()
-
-            # 检查旧文件并迁移
-            old_global = self.data_dir / "global_favour.json"
-            old_local = self.data_dir / "haogan.json"
-
-            if old_global.exists():
-                logger.info("检测到旧版全局好感度文件，开始迁移...")
-                await self.db_manager.migrate_from_json(old_global, is_global=True)
-
-            if old_local.exists():
-                logger.info("检测到旧版会话好感度文件，开始迁移...")
-                await self.db_manager.migrate_from_json(old_local, is_global=False)
-
         except Exception as e:
-            logger.error(f"数据库初始化或迁移失败: {str(e)}\n{traceback.format_exc()}")
+            logger.error(f"数据库初始化失败: {str(e)}\n{traceback.format_exc()}")
+
+        # 预热 Playwright 浏览器
+        try:
+            await self._ensure_browser()
+            logger.info("Playwright 浏览器预热完成")
+        except Exception as e:
+            logger.warning(f"Playwright 浏览器预热失败: {e}")
 
     def _validate_config(self) -> None:
         if self.min_favour_value >= self.max_favour_value:
@@ -341,6 +343,32 @@ class FavourManagerTool(Star):
             # default: 按添加时间 (created_at) 排序，如果没有则按 id
             return sorted(records, key=lambda x: x.created_at if x.created_at else datetime.min)
 
+    async def _ensure_browser(self):
+        if self._pw_browser is None or not self._pw_browser.is_connected():
+            from playwright.async_api import async_playwright
+            if self._pw_instance:
+                await self._pw_instance.stop()
+            self._pw_instance = await async_playwright().start()
+            self._pw_browser = await self._pw_instance.chromium.launch()
+        return self._pw_browser
+
+    async def _render_t2i(self, md_text: str) -> str:
+        browser = await self._ensure_browser()
+        page = await browser.new_page(viewport={"width": 800, "height": 600})
+
+        html = self._html_template.replace("{{ version }}", self._plugin_version)
+        safe_text = md_text.replace("\\", "\\\\").replace("`", "\\`").replace("${", "\\${")
+        html = html.replace("{{ text | safe }}", safe_text)
+
+        await page.set_content(html, wait_until="networkidle")
+
+        filename = hashlib.md5(md_text.encode()).hexdigest()[:12] + ".png"
+        output_path = self._t2i_output_dir / filename
+        await page.screenshot(path=str(output_path), full_page=True)
+        await page.close()
+
+        return str(output_path)
+
     async def _send_chunked_t2i(self, event: AstrMessageEvent, title: str, headers: List[str], rows: List[str], chunk_size: int = 200):
         """分块发送 T2I 图片"""
         total = len(rows)
@@ -358,8 +386,8 @@ class FavourManagerTool(Star):
 
             md_text = "\n".join(md_lines)
             try:
-                url = await self.text_to_image(md_text)
-                await event.send(event.image_result(url))
+                img_path = await self._render_t2i(md_text)
+                await event.send(event.image_result(img_path))
             except Exception as e:
                 logger.error(f"生成图片失败 (Page {page_info}): {e}")
                 await event.send(event.plain_result(f"生成图片失败，请检查日志。"))
@@ -484,6 +512,7 @@ class FavourManagerTool(Star):
             )
 
             req.system_prompt = f"{prompt_final}\n{req.system_prompt}".strip()
+            logger.debug(f"注入的好感度Prompt:\n{prompt_final}")
         except Exception as e:
             logger.error(f"注入好感度Prompt失败: {str(e)}\n{traceback.format_exc()}")
 
@@ -594,7 +623,7 @@ class FavourManagerTool(Star):
 
         name = await self._get_user_display_name(event, target_uid)
 
-        msg = f"🔍 用户：{name}\n🆔 ID：{target_uid}\n❤ 好感度：{fav}\n💕 关系：{self._get_relationship(fav)}"
+        msg = f"🔍 用户：{name}\n🆔 ID：{target_uid}\n❤ 好感度：{fav}\n🔗 关系：{self._get_relationship(fav)}"
         yield event.plain_result(msg)
 
     @filter.command("查询当前好感度", alias={'查当前好感度', '查询本群好感度', '查本群好感度', '查群好感度', '查询群好感度', '当前好感度', '本群好感度', '群好感度'})
@@ -982,7 +1011,7 @@ class FavourManagerTool(Star):
                     msg_parts.append("   示例: /查询好感度 @Wolfycz")
                 else:
                     msg_parts.append("   用法: /查询好感度")
-                    msg_parts.append("   说明: 你只能查看自己的好感度。")
+                    msg_parts.append("   说明: 查看自己的好感度。")
             if not self.is_global_favour:
                 if await self._check_command_permission(event, "查询当前好感度"):
                     msg_parts.append("   用法: /查询当前好感度 [页码]")
