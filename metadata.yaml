@@ -1,6 +1,6 @@
-name: "astrbot_plugin_favour_ultra_modify"
+name: "astrbot_plugin_favour_w"
 display_name: "可自定义好感度管理系统"
 author: "wolfycz"
-version: "v1.2.0"
+version: "v1.3.0"
 description: '基于 astrbot_plugin_favour_ultra 修改，移除了关系系统。'
 repo: "https://github.com/W-Wolfycz/favour_ultra"

@@ -5,14 +5,12 @@
 import json
 import asyncio
 from pathlib import Path
-from typing import Dict, List, Any, Optional, Tuple
+from typing import List, Optional, Tuple
 from datetime import datetime
 from aiofiles import open as aio_open
-from aiofiles.os import path as aio_path
-from sqlmodel import SQLModel, Field, select, delete, update
+from sqlmodel import SQLModel, Field, select, delete
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
-from sqlalchemy import text
 from astrbot.api import logger
 from .utils import is_valid_userid
 
@@ -23,7 +21,6 @@ class FavourRecord(SQLModel, table=True):
 
     id: Optional[int] = Field(default=None, primary_key=True)
     user_id: str = Field(index=True)
-    session_id: str = Field(default="global", index=True) # "global" 表示全局，或者具体的 session_id
     favour: int = Field(default=0)
     created_at: datetime = Field(default_factory=datetime.now)
     updated_at: datetime = Field(default_factory=datetime.now)
@@ -38,7 +35,6 @@ class FavourDBManager:
         self.min_val = min_val
         self.max_val = max_val
 
-        # 创建异步引擎
         self.engine = create_async_engine(self.db_url, echo=False)
         self.async_session = sessionmaker(
             self.engine, class_=AsyncSession, expire_on_commit=False
@@ -47,7 +43,6 @@ class FavourDBManager:
         self._init_lock = asyncio.Lock()
 
     async def init_db(self):
-        """初始化数据库表并执行必要的迁移"""
         if self._initialized:
             return
 
@@ -57,91 +52,13 @@ class FavourDBManager:
 
             try:
                 async with self.engine.begin() as conn:
-                    # 检查表是否存在
-                    result = await conn.execute(text("SELECT name FROM sqlite_master WHERE type='table' AND name='favour_records'"))
-                    table_exists = result.scalar() is not None
-
-                    if not table_exists:
-                        await conn.run_sync(SQLModel.metadata.create_all)
-                    else:
-                        # 检查是否缺少 created_at 字段 (数据库升级逻辑)
-                        result = await conn.execute(text("PRAGMA table_info(favour_records)"))
-                        columns = [row[1] for row in result.fetchall()]
-                        if "created_at" not in columns:
-                            logger.info("正在升级数据库：添加 created_at 字段...")
-                            await conn.execute(text("ALTER TABLE favour_records ADD COLUMN created_at DATETIME"))
-                            await conn.execute(text("UPDATE favour_records SET created_at = updated_at WHERE created_at IS NULL"))
-                            logger.info("数据库升级完成。")
-
+                    await conn.run_sync(SQLModel.metadata.create_all)
                 self._initialized = True
                 logger.info(f"好感度数据库已初始化: {self.db_path}")
             except Exception as e:
                 logger.error(f"数据库初始化失败: {e}")
 
-    async def migrate_from_json(self, json_path: Path, is_global: bool = False):
-        """从旧版JSON文件迁移数据"""
-        await self.init_db()
-        if not await aio_path.exists(json_path):
-            return
-
-        try:
-            async with aio_open(json_path, "r", encoding="utf-8") as f:
-                content = await f.read()
-                data = json.loads(content)
-
-            count = 0
-            async with self.async_session() as session:
-                if is_global:
-                    if isinstance(data, dict):
-                        for uid, fav in data.items():
-                            stmt = select(FavourRecord).where(
-                                FavourRecord.user_id == str(uid),
-                                FavourRecord.session_id == "global"
-                            )
-                            result = await session.execute(stmt)
-                            if not result.scalars().first():
-                                record = FavourRecord(
-                                    user_id=str(uid),
-                                    session_id="global",
-                                    favour=int(fav)
-                                )
-                                session.add(record)
-                                count += 1
-                else:
-                    if isinstance(data, list):
-                        for item in data:
-                            uid = str(item.get("userid", ""))
-                            sid = str(item.get("session_id", "")) or "global"
-                            if not uid: continue
-
-                            stmt = select(FavourRecord).where(
-                                FavourRecord.user_id == uid,
-                                FavourRecord.session_id == sid
-                            )
-                            result = await session.execute(stmt)
-                            if not result.scalars().first():
-                                record = FavourRecord(
-                                    user_id=uid,
-                                    session_id=sid,
-                                    favour=int(item.get("favour", 0)),
-                                )
-                                session.add(record)
-                                count += 1
-
-                await session.commit()
-
-            if count > 0:
-                logger.info(f"成功从 {json_path.name} 迁移了 {count} 条数据到数据库")
-                backup_path = json_path.with_suffix(".json.bak")
-                import shutil
-                shutil.move(json_path, backup_path)
-                logger.info(f"旧文件已备份为: {backup_path.name}")
-
-        except Exception as e:
-            logger.error(f"迁移数据失败 {json_path}: {str(e)}")
-
     async def backup_data(self, records: List[FavourRecord], prefix: str) -> Optional[str]:
-        """备份指定记录到JSON文件"""
         if not records:
             return None
         try:
@@ -164,37 +81,21 @@ class FavourDBManager:
             logger.error(f"备份数据失败: {e}")
             return None
 
-    async def get_favour(self, user_id: str, session_id: Optional[str] = None) -> Optional[FavourRecord]:
-        """获取好感度记录"""
+    async def get_favour(self, user_id: str) -> Optional[FavourRecord]:
         await self.init_db()
-        sid = session_id if session_id else "global"
         async with self.async_session() as session:
-            stmt = select(FavourRecord).where(
-                FavourRecord.user_id == user_id,
-                FavourRecord.session_id == sid
-            )
+            stmt = select(FavourRecord).where(FavourRecord.user_id == user_id)
             result = await session.execute(stmt)
             return result.scalars().first()
 
-    async def update_favour(
-        self,
-        user_id: str,
-        session_id: Optional[str],
-        favour: Optional[int] = None,
-    ) -> bool:
-        """更新好感度记录"""
+    async def update_favour(self, user_id: str, favour: Optional[int] = None) -> bool:
         await self.init_db()
         if not is_valid_userid(user_id):
             return False
 
-        sid = session_id if session_id else "global"
-
         try:
             async with self.async_session() as session:
-                stmt = select(FavourRecord).where(
-                    FavourRecord.user_id == user_id,
-                    FavourRecord.session_id == sid
-                )
+                stmt = select(FavourRecord).where(FavourRecord.user_id == user_id)
                 result = await session.execute(stmt)
                 record = result.scalars().first()
 
@@ -202,7 +103,6 @@ class FavourDBManager:
                     init_favour = max(self.min_val, min(self.max_val, favour)) if favour is not None else 0
                     record = FavourRecord(
                         user_id=user_id,
-                        session_id=sid,
                         favour=init_favour,
                     )
                     session.add(record)
@@ -218,40 +118,11 @@ class FavourDBManager:
             logger.error(f"更新数据库失败: {str(e)}")
             return False
 
-    async def update_user_all_records(
-        self,
-        user_id: str,
-        favour: Optional[int] = None,
-    ) -> int:
-        """更新某用户在所有会话中的记录（全局修改）"""
+    async def delete_favour(self, user_id: str) -> Tuple[bool, str]:
         await self.init_db()
-        if not is_valid_userid(user_id):
-            return 0
-
         try:
             async with self.async_session() as session:
-                values = {"updated_at": datetime.now()}
-                if favour is not None:
-                    values["favour"] = max(self.min_val, min(self.max_val, favour))
-
-                stmt = update(FavourRecord).where(FavourRecord.user_id == user_id).values(**values)
-                result = await session.execute(stmt)
-                await session.commit()
-                return result.rowcount
-        except Exception as e:
-            logger.error(f"全局更新失败: {str(e)}")
-            return 0
-
-    async def delete_favour(self, user_id: str, session_id: Optional[str] = None) -> Tuple[bool, str]:
-        """删除单条记录"""
-        await self.init_db()
-        sid = session_id if session_id else "global"
-        try:
-            async with self.async_session() as session:
-                stmt = select(FavourRecord).where(
-                    FavourRecord.user_id == user_id,
-                    FavourRecord.session_id == sid
-                )
+                stmt = select(FavourRecord).where(FavourRecord.user_id == user_id)
                 result = await session.execute(stmt)
                 record = result.scalars().first()
 
@@ -265,47 +136,14 @@ class FavourDBManager:
             logger.error(f"删除记录失败: {str(e)}")
             return False, f"数据库错误: {str(e)}"
 
-    async def get_all_in_session(self, session_id: Optional[str] = None) -> List[FavourRecord]:
-        """获取某会话下的所有记录"""
-        await self.init_db()
-        sid = session_id if session_id else "global"
-        async with self.async_session() as session:
-            stmt = select(FavourRecord).where(FavourRecord.session_id == sid)
-            result = await session.execute(stmt)
-            return list(result.scalars().all())
-
     async def get_global_records(self) -> List[FavourRecord]:
-        """仅获取全局记录"""
         await self.init_db()
         async with self.async_session() as session:
-            stmt = select(FavourRecord).where(FavourRecord.session_id == "global")
+            stmt = select(FavourRecord)
             result = await session.execute(stmt)
             return list(result.scalars().all())
-
-    async def get_non_global_records(self) -> List[FavourRecord]:
-        """获取所有非全局记录"""
-        await self.init_db()
-        async with self.async_session() as session:
-            stmt = select(FavourRecord).where(FavourRecord.session_id != "global")
-            result = await session.execute(stmt)
-            return list(result.scalars().all())
-
-    async def clear_session(self, session_id: Optional[str] = None) -> bool:
-        """清空某会话记录"""
-        await self.init_db()
-        sid = session_id if session_id else "global"
-        try:
-            async with self.async_session() as session:
-                stmt = delete(FavourRecord).where(FavourRecord.session_id == sid)
-                await session.execute(stmt)
-                await session.commit()
-                return True
-        except Exception as e:
-            logger.error(f"清空会话记录失败: {str(e)}")
-            return False
 
     async def clear_all(self) -> bool:
-        """清空所有记录"""
         await self.init_db()
         try:
             async with self.async_session() as session:
