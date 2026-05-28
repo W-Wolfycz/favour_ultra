@@ -9,6 +9,7 @@ from typing import List, Optional, Tuple
 from datetime import datetime
 from aiofiles import open as aio_open
 from sqlmodel import SQLModel, Field, select, delete
+from sqlalchemy import UniqueConstraint
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
 from astrbot.api import logger
@@ -17,9 +18,13 @@ from .utils import is_valid_userid
 # 定义数据库模型
 class FavourRecord(SQLModel, table=True):
     __tablename__ = "favour_records"
-    __table_args__ = {"extend_existing": True}
+    __table_args__ = (
+        UniqueConstraint("persona_id", "user_id", name="uq_persona_user"),
+        {"extend_existing": True},
+    )
 
     id: Optional[int] = Field(default=None, primary_key=True)
+    persona_id: str = Field(default="", index=True)
     user_id: str = Field(index=True)
     favour: int = Field(default=0)
     created_at: datetime = Field(default_factory=datetime.now)
@@ -81,27 +86,34 @@ class FavourDBManager:
             logger.error(f"备份数据失败: {e}")
             return None
 
-    async def get_favour(self, user_id: str) -> Optional[FavourRecord]:
+    async def get_favour(self, persona_id: str, user_id: str) -> Optional[FavourRecord]:
         await self.init_db()
         async with self.async_session() as session:
-            stmt = select(FavourRecord).where(FavourRecord.user_id == user_id)
+            stmt = select(FavourRecord).where(
+                FavourRecord.persona_id == persona_id,
+                FavourRecord.user_id == user_id,
+            )
             result = await session.execute(stmt)
             return result.scalars().first()
 
-    async def update_favour(self, user_id: str, favour: Optional[int] = None) -> bool:
+    async def update_favour(self, persona_id: str, user_id: str, favour: Optional[int] = None) -> bool:
         await self.init_db()
         if not is_valid_userid(user_id):
             return False
 
         try:
             async with self.async_session() as session:
-                stmt = select(FavourRecord).where(FavourRecord.user_id == user_id)
+                stmt = select(FavourRecord).where(
+                    FavourRecord.persona_id == persona_id,
+                    FavourRecord.user_id == user_id,
+                )
                 result = await session.execute(stmt)
                 record = result.scalars().first()
 
                 if not record:
                     init_favour = max(self.min_val, min(self.max_val, favour)) if favour is not None else 0
                     record = FavourRecord(
+                        persona_id=persona_id,
                         user_id=user_id,
                         favour=init_favour,
                     )
@@ -118,11 +130,14 @@ class FavourDBManager:
             logger.error(f"更新数据库失败: {str(e)}")
             return False
 
-    async def delete_favour(self, user_id: str) -> Tuple[bool, str]:
+    async def delete_favour(self, persona_id: str, user_id: str) -> Tuple[bool, str]:
         await self.init_db()
         try:
             async with self.async_session() as session:
-                stmt = select(FavourRecord).where(FavourRecord.user_id == user_id)
+                stmt = select(FavourRecord).where(
+                    FavourRecord.persona_id == persona_id,
+                    FavourRecord.user_id == user_id,
+                )
                 result = await session.execute(stmt)
                 record = result.scalars().first()
 
@@ -136,18 +151,18 @@ class FavourDBManager:
             logger.error(f"删除记录失败: {str(e)}")
             return False, f"数据库错误: {str(e)}"
 
-    async def get_global_records(self) -> List[FavourRecord]:
+    async def get_global_records(self, persona_id: str) -> List[FavourRecord]:
         await self.init_db()
         async with self.async_session() as session:
-            stmt = select(FavourRecord)
+            stmt = select(FavourRecord).where(FavourRecord.persona_id == persona_id)
             result = await session.execute(stmt)
             return list(result.scalars().all())
 
-    async def clear_all(self) -> bool:
+    async def clear_all(self, persona_id: str) -> bool:
         await self.init_db()
         try:
             async with self.async_session() as session:
-                stmt = delete(FavourRecord)
+                stmt = delete(FavourRecord).where(FavourRecord.persona_id == persona_id)
                 await session.execute(stmt)
                 await session.commit()
                 return True

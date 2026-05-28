@@ -21,12 +21,6 @@
     ],
     "hint": "default: 按添加时间排序\nfavour: 按好感度从高到低排序\nnickname: 按昵称A-Z排序\nuserid: 按用户ID排序"
   },
-  "enable_cold_violence": {
-    "description": "是否启用冷暴力模式",
-    "type": "bool",
-    "default": true,
-    "hint": "开启后，当好感度连续降低达到指定次数时触发冷暴力（拒绝回复/敷衍）。"
-  },
   "min_favour_value": {
     "description": "好感度数值下限（例如 -100）",
     "type": "int",
@@ -44,6 +38,13 @@
     "type": "int",
     "default": 0,
     "hint": "新用户首次交互时的初始好感度值。别超出自定义的范围哦！"
+  },
+  "judge_provider": {
+    "description": "裁判模型",
+    "type": "string",
+    "default": "",
+    "_special": "select_provider",
+    "hint": "判断好感度变化的模型，留空则使用当前默认对话模型。"
   },
   "relationship_config": {
     "description": "好感度关系映射配置",
@@ -81,6 +82,12 @@
         "type": "int",
         "default": 50,
         "hint": "好感度特使和Bot管理员的初始好感度值。"
+      },
+      "admin_default_relationship": {
+        "description": "框架管理员/特使关系",
+        "type": "string",
+        "default": "",
+        "hint": "留空则使用 relationship_config 中的映射关系。非空则框架管理员/特使在计算时使用该特殊值。"
       },
       "favour_envoys": {
         "description": "好感度特使用户ID列表",
@@ -165,47 +172,6 @@
         "default": "群管理员",
         "options": ["普通成员", "高等级群员", "群管理员", "群主", "Bot管理员"],
         "hint": "低于此等级的用户使用「查询好感度」时只能查看自身好感度，无法查看他人。"
-      }
-    }
-  },
-  "cold_violence_config": {
-    "description": "冷暴力模式配置",
-    "type": "object",
-    "hint": "配置当好感度连续降低时触发的冷暴力行为。",
-    "items": {
-      "consecutive_decrease_threshold": {
-        "description": "连续降低触发次数",
-        "type": "int",
-        "default": 3,
-        "hint": "当好感度连续降低达到此次数时，将触发冷暴力模式。"
-      },
-      "duration_minutes": {
-        "description": "持续时间（分钟）",
-        "type": "int",
-        "default": 60,
-        "hint": "触发冷暴力后，需要经过这段时间才能恢复正常对话。"
-      },
-      "replies": {
-        "type": "object",
-        "description": "自定义回复",
-        "hint": "自定义冷暴力期间的自动回复。{time_str} 为剩余时间。",
-        "items": {
-          "on_trigger": {
-            "type": "string",
-            "description": "触发时附加在回复末尾的消息",
-            "default": "......（我不想理你了。）"
-          },
-          "on_message": {
-            "type": "string",
-            "description": "拦截用户消息时的自动回复",
-            "default": "[自动回复]不想理你,{time_str}后再找我"
-          },
-          "on_query": {
-            "type": "string",
-            "description": "用户查询好感度时的回复",
-            "default": "冷暴力呢，看什么看，{time_str}之后再找我说话"
-          }
-        }
       }
     }
   }
